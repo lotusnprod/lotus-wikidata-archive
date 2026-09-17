@@ -1,5 +1,7 @@
 # LOTUS Wikidata SMILES archive
 
+[![Zenodo DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22811236.svg)](https://doi.org/10.5281/zenodo.22811236)
+
 `lotus-wikidata-archive` periodically extracts, validates, packages, and publishes the Wikidata projection used for LOTUS.
 
 ## Inclusion, deduplication, and SMILES semantics
