@@ -27,7 +27,7 @@ jobs:
       - name: Fetch, validate, package, and publish next version
         run: cargo run --release -- --output-dir artifacts --publish --creator 'The LOTUS Initiative'
       - name: Retain generated archive provenance
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lotus-wikidata-smiles
           path: |

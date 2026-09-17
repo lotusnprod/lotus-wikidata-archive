@@ -21,7 +21,7 @@ jobs:
       - name: Fetch, validate, package, and validate Zenodo plan
         run: cargo run --release -- --output-dir artifacts --publish --dry-run --creator 'The LOTUS Initiative'
       - name: Retain verified archive provenance
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lotus-wikidata-smiles-verified
           path: |
