@@ -21,9 +21,11 @@ jobs:
         run: test -n "$ZENODO_ROOT_DEPOSITION_ID"
       - name: Fetch, validate, package, and publish next version
         run: cargo run --release -- --output-dir artifacts --publish --creator 'The LOTUS Initiative'
-      - name: Retain generated archive
+      - name: Retain generated archive and manifest
         uses: actions/upload-artifact@v4
         with:
           name: lotus-wikidata-smiles
-          path: artifacts/*.tar.gz
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.manifest.json
           retention-days: 90

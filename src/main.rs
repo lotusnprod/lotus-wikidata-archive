@@ -76,7 +76,7 @@ async fn run_once(args: &Args) -> Result<()> {
         "lotus-wikidata-smiles-{}.tar.gz",
         fetched_at.format("%Y%m%dT%H%M%SZ")
     );
-    let archive = write_archive(
+    let artifacts = write_archive(
         args.output_dir.join(filename),
         fetched_at,
         &args.qlever_endpoint,
@@ -89,17 +89,25 @@ async fn run_once(args: &Args) -> Result<()> {
         "wrote {} InChIKey-deduplicated records and {} parse errors to {}",
         records.len(),
         errors.len(),
-        archive.display()
+        artifacts.archive.display()
+    );
+    println!(
+        "wrote standalone manifest to {}",
+        artifacts.manifest.display()
     );
     if args.publish {
         let title = format!("LOTUS Wikidata SMILES — {}", fetched_at.date_naive());
         if args.dry_run {
-            let plan =
-                dry_run_publish_archive(&archive, &title, &args.creator, fetched_at.date_naive())?;
+            let plan = dry_run_publish_archive(
+                &artifacts,
+                &title,
+                &args.creator,
+                fetched_at.date_naive(),
+            )?;
             println!("Zenodo dry run: would {plan}; no Zenodo request was made");
         } else {
             let record_id =
-                publish_archive(&archive, &title, &args.creator, fetched_at.date_naive()).await?;
+                publish_archive(&artifacts, &title, &args.creator, fetched_at.date_naive()).await?;
             println!("published Zenodo record {record_id}");
         }
     }

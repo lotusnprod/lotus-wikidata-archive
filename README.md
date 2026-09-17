@@ -20,16 +20,18 @@ The query is submitted as SPARQL Results JSON to QLever's public Wikidata endpoi
 
 Strict `smiles-rs` parsing runs on **all fetched source values before deduplication**. That makes an invalid lower-priority canonical value visible even if an isomeric value is selected for the same InChIKey.
 
-Every run writes one `tar.gz` with deterministic member metadata and three members:
+Every run writes a gzip-compressed `tar.gz` and a same-named standalone
+`.manifest.json`. The standalone manifest is uploaded beside the archive to
+Zenodo so its counts and provenance can be inspected directly in the record
+UI; the identical copy remains inside the tarball for self-contained archival.
+
+The tarball has deterministic member metadata and three members:
 
 | Member | Contents |
 | --- | --- |
 | `lotus-wikidata-smiles.csv` | Selected one-per-InChIKey data: `inchi_key`, source `wikidata_id`, `smiles_kind`, and verbatim `smiles`. |
 | `smiles-parse-errors.csv` | Every parser failure from the fetched source projection, including its InChIKey and parser message. |
 | `manifest.json` | Fetch timestamp, QLever endpoint, base SPARQL query, page size, source count, selected count, and error count. |
-
-Invalid input remains observable in the error report instead of being silently discarded. The report ships inside the same Zenodo artifact as the selected archive.
-
 ## Run
 
 One archive run:

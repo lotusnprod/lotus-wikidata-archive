@@ -311,7 +311,19 @@ struct Manifest<'a> {
     parse_errors: usize,
 }
 
-/// Writes a gzip-compressed tar archive containing data, parser errors, and provenance.
+/// Paths emitted for one source snapshot.
+///
+/// The manifest is both an archive member and a standalone Zenodo upload so
+/// its counts and provenance are inspectable in the record UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveArtifacts {
+    /// Gzip-compressed source archive.
+    pub archive: PathBuf,
+    /// Standalone copy of the archive manifest.
+    pub manifest: PathBuf,
+}
+
+/// Writes a gzip-compressed tar archive and a standalone manifest beside it.
 ///
 /// The archive members have a fixed metadata timestamp so the only intended run-specific
 /// value is `manifest.json`'s `fetched_at` field.
@@ -322,7 +334,7 @@ pub fn write_archive(
     source_records: usize,
     records: &[SmilesRecord],
     parse_errors: &[ParseErrorRecord],
-) -> Result<PathBuf> {
+) -> Result<ArchiveArtifacts> {
     let output = output.as_ref();
     let parent = output
         .parent()
@@ -350,7 +362,22 @@ pub fn write_archive(
     append_member(&mut archive, "manifest.json", &manifest)?;
     archive.finish().context("finish archive")?;
 
-    Ok(output.to_owned())
+    let manifest_path = standalone_manifest_path(output)?;
+    std::fs::write(&manifest_path, &manifest)
+        .with_context(|| format!("write {}", manifest_path.display()))?;
+    Ok(ArchiveArtifacts {
+        archive: output.to_owned(),
+        manifest: manifest_path,
+    })
+}
+
+fn standalone_manifest_path(archive: &Path) -> Result<PathBuf> {
+    let filename = archive
+        .file_name()
+        .context("archive output path has no filename")?
+        .to_string_lossy();
+    let stem = filename.strip_suffix(".tar.gz").unwrap_or(&filename);
+    Ok(archive.with_file_name(format!("{stem}.manifest.json")))
 }
 
 fn records_csv_bytes(records: &[SmilesRecord]) -> Result<Vec<u8>, csv::Error> {
@@ -395,13 +422,13 @@ fn append_member(
 /// The returned text identifies whether an eventual publication would create
 /// the first record or a new version in an existing record family.
 pub fn dry_run_publish_archive(
-    archive: &Path,
+    artifacts: &ArchiveArtifacts,
     title: &str,
     creator: &str,
     publication_date: chrono::NaiveDate,
 ) -> Result<String> {
     let _metadata = zenodo_metadata(title, creator, publication_date)?;
-    let _files = archive_upload(archive)?;
+    let _files = archive_upload(artifacts)?;
     match std::env::var("ZENODO_ROOT_DEPOSITION_ID") {
         Ok(root_id) => {
             root_id
@@ -420,14 +447,14 @@ pub fn dry_run_publish_archive(
 /// create a new version in that record family. Without it, this bootstraps a
 /// new record; configure the emitted ID before the next scheduled run.
 pub async fn publish_archive(
-    archive: &Path,
+    artifacts: &ArchiveArtifacts,
     title: &str,
     creator: &str,
     publication_date: chrono::NaiveDate,
 ) -> Result<u64> {
     let client = ZenodoClient::from_env().context("read ZENODO_TOKEN")?;
     let metadata = zenodo_metadata(title, creator, publication_date)?;
-    let files = archive_upload(archive)?;
+    let files = archive_upload(artifacts)?;
 
     let publication = match std::env::var("ZENODO_ROOT_DEPOSITION_ID") {
         Ok(root_id) => {
@@ -475,13 +502,24 @@ fn zenodo_metadata(
         .context("build Zenodo metadata")
 }
 
-fn archive_upload(archive: &Path) -> Result<Vec<UploadSpec>> {
-    let archive_name = archive
+fn archive_upload(artifacts: &ArchiveArtifacts) -> Result<Vec<UploadSpec>> {
+    let archive_name = artifacts
+        .archive
         .file_name()
         .context("archive path does not have a filename")?
         .to_string_lossy()
         .into_owned();
-    UploadSpec::from_named_paths([(archive_name, archive)]).context("prepare Zenodo archive upload")
+    let manifest_name = artifacts
+        .manifest
+        .file_name()
+        .context("manifest path does not have a filename")?
+        .to_string_lossy()
+        .into_owned();
+    UploadSpec::from_named_paths([
+        (archive_name, &artifacts.archive),
+        (manifest_name, &artifacts.manifest),
+    ])
+    .context("prepare Zenodo archive uploads")
 }
 
 #[cfg(test)]
@@ -526,7 +564,7 @@ mod tests {
         let records = vec![record("KEY1", "Q1", SmilesKind::Canonical, "CCO")];
         let errors = validate_smiles(&records);
 
-        write_archive(
+        let artifacts = write_archive(
             &path,
             Utc.with_ymd_and_hms(2026, 9, 17, 0, 0, 0).unwrap(),
             DEFAULT_QLEVER_ENDPOINT,
@@ -536,7 +574,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut archive = tar::Archive::new(GzDecoder::new(File::open(path).unwrap()));
+        let mut archive =
+            tar::Archive::new(GzDecoder::new(File::open(&artifacts.archive).unwrap()));
         let mut members = std::collections::BTreeMap::new();
         for entry in archive.entries().unwrap() {
             let mut entry = entry.unwrap();
@@ -551,6 +590,13 @@ mod tests {
             "inchi_key,wikidata_id,smiles_kind,smiles,error\n"
         );
         let manifest: serde_json::Value = serde_json::from_str(&members["manifest.json"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&artifacts.manifest).unwrap(),
+            members["manifest.json"]
+        );
+        let uploads = archive_upload(&artifacts).unwrap();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[1].filename, "lotus.manifest.json");
         assert_eq!(manifest["query"], LOTUS_SMILES_QUERY);
         assert_eq!(manifest["page_size"], QLEVER_PAGE_SIZE);
         assert_eq!(manifest["source_records"], 1);
