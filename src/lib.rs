@@ -393,7 +393,7 @@ struct Manifest<'a> {
     fetched_at: DateTime<Utc>,
     qlever_endpoint: &'a str,
     /// SPARQL query selecting source records with P235.
-    query: &'static str,
+    query: &'a str,
     /// SPARQL query used to find entries excluded for missing P235.
     missing_inchi_key_query: &'static str,
     /// Maximum result rows requested by each stable query page.
