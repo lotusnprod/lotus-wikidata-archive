@@ -1,0 +1,24 @@
+[package]
+name = "lotus-wikidata-archive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Periodically archive and validate LOTUS SMILES from Wikidata"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.100"
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5.60", features = ["derive"] }
+csv = "1.4.0"
+flate2 = "1.1.9"
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+smiles-rs = "0.1.4"
+tar = "0.4.45"
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "time"] }
+zenodo-rs = "0.3.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
