@@ -8,6 +8,8 @@ use lotus_wikidata_archive::{
     DEFAULT_QLEVER_ENDPOINT, QleverClient, deduplicate_by_inchi_key, dry_run_publish_archive,
     publish_archive, validate_missing_inchi_key_smiles, validate_smiles, write_archive,
 };
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 /// Periodically archive and validate LOTUS SMILES sourced from Wikidata.
 #[derive(Debug, Parser)]
@@ -40,6 +42,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .with_ansi(false)
+        .init();
     let args = Args::parse();
     if args.dry_run && !args.publish {
         bail!("--dry-run requires --publish");
@@ -89,18 +98,15 @@ async fn run_once(args: &Args) -> Result<()> {
         &errors,
     )?;
 
-    println!(
-        "wrote {} InChIKey-deduplicated records, {} missing-InChIKey records, and {} parse errors to {}",
-        records.len(),
-        missing_inchi_key_records.len(),
-        errors.len(),
-        artifacts.archive.display()
+    info!(
+        records = records.len(),
+        missing_inchi_key_records = missing_inchi_key_records.len(),
+        parse_errors = errors.len(),
+        archive = %artifacts.archive.display(),
+        "archive written"
     );
-    println!(
-        "wrote standalone manifest to {}",
-        artifacts.manifest.display()
-    );
-    println!("wrote checksums to {}", artifacts.checksums.display());
+    info!(manifest = %artifacts.manifest.display(), "standalone manifest written");
+    info!(checksums = %artifacts.checksums.display(), "checksums written");
     if args.publish {
         let title = format!("LOTUS Wikidata SMILES — {}", fetched_at.date_naive());
         if args.dry_run {
@@ -110,11 +116,11 @@ async fn run_once(args: &Args) -> Result<()> {
                 &args.creator,
                 fetched_at.date_naive(),
             )?;
-            println!("Zenodo dry run: would {plan}; no Zenodo request was made");
+            info!(%plan, "Zenodo dry run; no Zenodo request was made");
         } else {
             let record_id =
                 publish_archive(&artifacts, &title, &args.creator, fetched_at.date_naive()).await?;
-            println!("published Zenodo record {record_id}");
+            info!(record_id, "Zenodo record published");
         }
     }
     Ok(())

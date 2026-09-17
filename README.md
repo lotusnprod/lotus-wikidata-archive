@@ -52,6 +52,8 @@ cargo run --release -- --output-dir artifacts --period-hours 168
 
 `--period-hours` must be at least one. The process stops on fetch, package, or publish failure rather than silently skipping a source snapshot.
 
+The executable emits plain structured logs to standard error, which GitHub Actions renders without terminal colour codes. Successful runs report stable fields for record counts and output paths. The default level is `info`; set `RUST_LOG=warn` to suppress success output.
+
 ## Zenodo publishing and record versioning
 
 Publishing is opt-in and needs a production token with `deposit:write` and `deposit:actions`. Every published record receives a Zenodo related-resource link to the **exact immutable source revision** that generated it.

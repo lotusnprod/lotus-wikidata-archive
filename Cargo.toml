@@ -20,6 +20,8 @@ tar = "0.4.45"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "time"] }
 zenodo-rs = "0.3.0"
 sha2 = "0.10.9"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
