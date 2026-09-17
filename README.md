@@ -14,7 +14,7 @@ A source statement is selected when its Wikidata entity has:
 
 The archive has one record per InChIKey. `P2017` always wins over `P233`, preserving available stereochemistry and isotope information. If no isomeric value exists, the canonical value is retained. If Wikidata supplies multiple values at the same priority, lexical SMILES then Wikidata entity ID resolves the tie deterministically.
 
-Values are never re-rendered or re-canonicalized: canonicality is meaningful only relative to the source producer. Records without an InChIKey are deliberately excluded; assigning an ad-hoc identity would defeat reliable cross-item deduplication.
+Records without an InChIKey are never assigned an ad-hoc identity. They are written to `missing-inchikey.csv` with a manifest count, making this curation gap observable while retaining safe InChIKey deduplication.
 
 The query is submitted as SPARQL Results JSON to QLever's public Wikidata endpoint in stable `LIMIT`/`OFFSET` pages of 50,000 rows. The client honours `Retry-After` and retries transient server and rate-limit responses. This projection has no RDF graph to materialize, so it uses standard SPARQL result JSON rather than adding Sophia solely as a transport dependency.
 
@@ -22,18 +22,20 @@ The query is submitted as SPARQL Results JSON to QLever's public Wikidata endpoi
 
 Strict `smiles-rs` parsing runs on **all fetched source values before deduplication**. That makes an invalid lower-priority canonical value visible even if an isomeric value is selected for the same InChIKey.
 
-Every run writes a gzip-compressed `tar.gz` and a same-named standalone
-`.manifest.json`. The standalone manifest is uploaded beside the archive to
-Zenodo so its counts and provenance can be inspected directly in the record
-UI; the identical copy remains inside the tarball for self-contained archival.
+Every run writes a gzip-compressed `tar.gz`, a same-named standalone
+`.manifest.json`, and a same-named `.SHA256SUMS` file. The standalone manifest
+and checksums are uploaded beside the archive to Zenodo for direct record-UI
+inspection; the identical manifest remains inside the tarball for
+self-contained archival.
 
-The tarball has deterministic member metadata and three members:
+The tarball has deterministic member metadata and four members:
 
 | Member | Contents |
 | --- | --- |
 | `lotus-wikidata-smiles.csv` | Selected one-per-InChIKey data: `inchi_key`, source `wikidata_id`, `smiles_kind`, and verbatim `smiles`. |
-| `smiles-parse-errors.csv` | Every parser failure from the fetched source projection, including its InChIKey and parser message. |
-| `manifest.json` | Fetch timestamp, QLever endpoint, base SPARQL query, page size, source count, selected count, and error count. |
+| `missing-inchikey.csv` | P703 + SMILES source values that lack P235 and cannot be safely deduplicated. |
+| `smiles-parse-errors.csv` | Every parser failure from the keyed and missing-InChIKey source projections. |
+| `manifest.json` | Fetch timestamp, both source queries, page size, keyed/missing source counts, selected count, and error count. |
 ## Run
 
 One archive run:
@@ -52,9 +54,12 @@ cargo run --release -- --output-dir artifacts --period-hours 168
 
 ## Zenodo publishing and record versioning
 
-Publishing is opt-in and needs a production token with `deposit:write` and `deposit:actions`:
+Publishing is opt-in and needs a production token with `deposit:write` and `deposit:actions`. Every published record receives a Zenodo related-resource link to the **exact immutable source revision** that generated it.
+
+On GitHub Actions, this link is constructed from `GITHUB_SERVER_URL`, `GITHUB_REPOSITORY`, and `GITHUB_SHA`. For a local dry run or publication, set it explicitly:
 
 ```bash
+export SOURCE_CODE_URL="https://github.com/<owner>/<repo>/commit/<full-commit-sha>"
 export ZENODO_TOKEN=... # never commit this value
 cargo run --release -- --output-dir artifacts --publish --creator 'The LOTUS Initiative'
 ```
@@ -62,26 +67,28 @@ cargo run --release -- --output-dir artifacts --publish --creator 'The LOTUS Ini
 Dry-run the complete local publication plan without contacting Zenodo:
 
 ```bash
+export SOURCE_CODE_URL="https://github.com/<owner>/<repo>/commit/<full-commit-sha>"
 cargo run --release -- --output-dir artifacts --publish --dry-run --creator 'The LOTUS Initiative'
 ```
 
-This fetches, validates, deduplicates, packages, and checks the exact Zenodo metadata and upload input. It never sends an HTTP request to Zenodo and never creates a draft.
+This fetches, validates, deduplicates, packages, verifies checksums, and checks the exact Zenodo metadata/upload inputs. It never sends an HTTP request to Zenodo and never creates a draft.
 
-Without `ZENODO_ROOT_DEPOSITION_ID`, that command creates the first Zenodo record and prints its version-specific record ID. Set that ID as `ZENODO_ROOT_DEPOSITION_ID` before the next publication:
+Without `ZENODO_ROOT_DEPOSITION_ID`, a non-dry publication creates the first Zenodo record and prints its version-specific record ID. Set that concrete **published deposition ID** before the next publication:
 
 ```bash
 export ZENODO_ROOT_DEPOSITION_ID=1234567
 ```
 
-With the root ID set, the client asks `zenodo-rs` for the latest published version, creates its editable `newversion` draft, uploads the next archive, and publishes it. This preserves the Zenodo concept record and its version history rather than creating unrelated deposits. Every record is a public `CC-BY-4.0` Dataset submitted to the `the-lotus-initiative` community. Community acceptance may still require moderator approval.
+Do not use a concept DOI or its numeric suffix as `ZENODO_ROOT_DEPOSITION_ID`. With a valid root ID, the client asks `zenodo-rs` for the latest published version, creates its editable `newversion` draft, uploads the next archive, and publishes it. This preserves the Zenodo concept record and its version history rather than creating unrelated deposits. Every record is a public `CC-BY-4.0` Dataset submitted to the `the-lotus-initiative` community. Community acceptance may still require moderator approval.
 
 ## Scheduled GitHub Actions operation
 
-`.github/workflows/publish.yml` runs every Monday at 03:17 UTC and also supports manual dispatch. Configure these repository values before enabling scheduled publication:
-- Actions secret `ZENODO_TOKEN` — production Zenodo token.
-- Actions variable `ZENODO_ROOT_DEPOSITION_ID` — the initial published record ID created during bootstrap.
+`publish.yml` runs every Monday at 03:17 UTC and also supports manual dispatch. It serializes all production publications with the `lotus-zenodo-publish` concurrency group. Configure these repository values before enabling it:
 
-The workflow refuses to publish without the root ID, preventing accidental creation of a second record family. It retains each generated archive as an Actions artifact for 90 days independently of Zenodo.
+- Actions secret `ZENODO_TOKEN` — production Zenodo token.
+- Actions variable `ZENODO_ROOT_DEPOSITION_ID` — concrete published deposition ID, never a concept DOI suffix.
+
+`verify.yml` runs a non-publishing full fetch/package/Zenodo-plan check every Saturday at 03:17 UTC and can also be manually dispatched. It requires no Zenodo secret. Both workflows retain the tarball, manifest, and SHA-256 checksums as Actions artifacts.
 
 ## Verification
 
@@ -91,4 +98,4 @@ cargo fmt --check
 cargo clippy -- -D warnings
 ```
 
-Unit tests cover parser error retention, archive/provenance generation, QLever row decoding, and the observable one-per-InChIKey selection rule. A live QLever smoke run fetched 400,513 source statements, selected 227,409 unique InChIKeys, produced two parser errors, and confirmed that the error report is included. Production Zenodo publishing is not attempted by tests because it requires an authorized token and creates a permanent record version.
+Unit tests cover parser-error retention, archive/provenance generation, QLever row decoding, missing-InChIKey reporting, immutable source-revision links, and the observable one-per-InChIKey selection rule. A full QLever run on 2026-09-17 selected 227,409 unique InChIKeys, reported eight source values without InChIKeys, produced four parser errors, and wrote the archive, manifest, and checksums. Production Zenodo publishing is not attempted by tests because it requires an authorized token and creates a permanent record version.

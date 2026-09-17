@@ -6,7 +6,7 @@ use chrono::Utc;
 use clap::Parser;
 use lotus_wikidata_archive::{
     DEFAULT_QLEVER_ENDPOINT, QleverClient, deduplicate_by_inchi_key, dry_run_publish_archive,
-    publish_archive, validate_smiles, write_archive,
+    publish_archive, validate_missing_inchi_key_smiles, validate_smiles, write_archive,
 };
 
 /// Periodically archive and validate LOTUS SMILES sourced from Wikidata.
@@ -66,10 +66,13 @@ async fn main() -> Result<()> {
 
 async fn run_once(args: &Args) -> Result<()> {
     let fetched_at = Utc::now();
-    let source_records = QleverClient::new(&args.qlever_endpoint)
-        .fetch_lotus_smiles()
-        .await?;
-    let errors = validate_smiles(&source_records);
+    let client = QleverClient::new(&args.qlever_endpoint);
+    let source_records = client.fetch_lotus_smiles().await?;
+    let missing_inchi_key_records = client.fetch_missing_inchi_key_smiles().await?;
+    let mut errors = validate_smiles(&source_records);
+    errors.extend(validate_missing_inchi_key_smiles(
+        &missing_inchi_key_records,
+    ));
     let source_record_count = source_records.len();
     let records = deduplicate_by_inchi_key(source_records);
     let filename = format!(
@@ -81,13 +84,15 @@ async fn run_once(args: &Args) -> Result<()> {
         fetched_at,
         &args.qlever_endpoint,
         source_record_count,
+        &missing_inchi_key_records,
         &records,
         &errors,
     )?;
 
     println!(
-        "wrote {} InChIKey-deduplicated records and {} parse errors to {}",
+        "wrote {} InChIKey-deduplicated records, {} missing-InChIKey records, and {} parse errors to {}",
         records.len(),
+        missing_inchi_key_records.len(),
         errors.len(),
         artifacts.archive.display()
     );
@@ -95,6 +100,7 @@ async fn run_once(args: &Args) -> Result<()> {
         "wrote standalone manifest to {}",
         artifacts.manifest.display()
     );
+    println!("wrote checksums to {}", artifacts.checksums.display());
     if args.publish {
         let title = format!("LOTUS Wikidata SMILES — {}", fetched_at.date_naive());
         if args.dry_run {

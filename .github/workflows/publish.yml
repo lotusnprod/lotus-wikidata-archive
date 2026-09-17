@@ -8,11 +8,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: lotus-zenodo-publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     env:
       ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+      # This is a concrete published deposition ID, never the concept DOI suffix.
       ZENODO_ROOT_DEPOSITION_ID: ${{ vars.ZENODO_ROOT_DEPOSITION_ID }}
     steps:
       - uses: actions/checkout@v4
@@ -21,11 +26,12 @@ jobs:
         run: test -n "$ZENODO_ROOT_DEPOSITION_ID"
       - name: Fetch, validate, package, and publish next version
         run: cargo run --release -- --output-dir artifacts --publish --creator 'The LOTUS Initiative'
-      - name: Retain generated archive and manifest
+      - name: Retain generated archive provenance
         uses: actions/upload-artifact@v4
         with:
           name: lotus-wikidata-smiles
           path: |
             artifacts/*.tar.gz
             artifacts/*.manifest.json
+            artifacts/*.SHA256SUMS
           retention-days: 90

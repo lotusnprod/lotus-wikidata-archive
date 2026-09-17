@@ -1,0 +1,31 @@
+name: Verify LOTUS Wikidata archive
+
+on:
+  schedule:
+    - cron: '17 3 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lotus-archive-verify
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch, validate, package, and validate Zenodo plan
+        run: cargo run --release -- --output-dir artifacts --publish --dry-run --creator 'The LOTUS Initiative'
+      - name: Retain verified archive provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: lotus-wikidata-smiles-verified
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.manifest.json
+            artifacts/*.SHA256SUMS
+          retention-days: 14

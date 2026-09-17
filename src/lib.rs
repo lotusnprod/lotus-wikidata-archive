@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,10 +12,12 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use smiles_rs::Smiles;
 use tar::{Builder, Header};
 use zenodo_rs::{
-    AccessRight, DepositMetadataUpdate, DepositionId, UploadSpec, UploadType, ZenodoClient,
+    AccessRight, DepositMetadataUpdate, DepositionId, RelatedIdentifier, UploadSpec, UploadType,
+    ZenodoClient,
 };
 /// QLever's public Wikidata SPARQL endpoint.
 pub const DEFAULT_QLEVER_ENDPOINT: &str = "https://qlever.dev/api/wikidata";
@@ -36,6 +39,28 @@ PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 SELECT DISTINCT ?compound ?inchiKey ?smiles ?smilesKind WHERE {
   ?compound wdt:P703 ?taxon ;
             wdt:P235 ?inchiKey .
+  {
+    ?compound wdt:P233 ?smiles .
+    BIND("canonical" AS ?smilesKind)
+  }
+  UNION
+  {
+    ?compound wdt:P2017 ?smiles .
+    BIND("isomeric" AS ?smilesKind)
+  }
+}
+ORDER BY ?compound ?smilesKind ?smiles
+"#;
+
+/// Finds otherwise eligible source statements that lack an InChIKey.
+///
+/// These rows cannot be safely deduplicated and are reported separately.
+pub const LOTUS_SMILES_WITHOUT_INCHIKEY_QUERY: &str = r#"
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+
+SELECT DISTINCT ?compound ?smiles ?smilesKind WHERE {
+  ?compound wdt:P703 ?taxon .
+  FILTER NOT EXISTS { ?compound wdt:P235 ?inchiKey }
   {
     ?compound wdt:P233 ?smiles .
     BIND("canonical" AS ?smilesKind)
@@ -82,6 +107,16 @@ pub struct SmilesRecord {
     pub smiles: String,
 }
 
+/// Source SMILES with P703 but no P235 InChIKey.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct MissingInchiKeyRecord {
+    /// Wikidata entity ID, e.g. `Q153`.
+    pub wikidata_id: String,
+    /// Whether this is P233 or P2017.
+    pub smiles_kind: SmilesKind,
+    /// The unmodified Wikidata string value.
+    pub smiles: String,
+}
 /// A SMILES parser failure included beside the source archive.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ParseErrorRecord {
@@ -111,7 +146,7 @@ struct SparqlResults {
 struct SparqlBinding {
     compound: SparqlValue,
     #[serde(rename = "inchiKey")]
-    inchi_key: SparqlValue,
+    inchi_key: Option<SparqlValue>,
     smiles: SparqlValue,
     #[serde(rename = "smilesKind")]
     smiles_kind: SparqlValue,
@@ -141,16 +176,28 @@ impl QleverClient {
     /// Executes every stable page of [`LOTUS_SMILES_QUERY`] and returns the
     /// already ordered, duplicate-free source records.
     pub async fn fetch_lotus_smiles(&self) -> Result<Vec<SmilesRecord>> {
-        let mut records = Vec::new();
+        decode_sparql_bindings(self.fetch_bindings(LOTUS_SMILES_QUERY).await?)
+    }
+
+    /// Retrieves source values that cannot be deduplicated because P235 is absent.
+    pub async fn fetch_missing_inchi_key_smiles(&self) -> Result<Vec<MissingInchiKeyRecord>> {
+        decode_missing_inchi_key_bindings(
+            self.fetch_bindings(LOTUS_SMILES_WITHOUT_INCHIKEY_QUERY)
+                .await?,
+        )
+    }
+
+    async fn fetch_bindings(&self, query: &str) -> Result<Vec<SparqlBinding>> {
+        let mut bindings = Vec::new();
         let mut offset = 0;
 
         loop {
-            let bindings = self.fetch_page(offset).await?;
-            let page_len = bindings.len();
-            records.extend(decode_sparql_bindings(bindings)?);
+            let page = self.fetch_page(query, offset).await?;
+            let page_len = page.len();
+            bindings.extend(page);
 
             if page_len < QLEVER_PAGE_SIZE {
-                return Ok(records);
+                return Ok(bindings);
             }
             offset = offset
                 .checked_add(QLEVER_PAGE_SIZE)
@@ -158,11 +205,11 @@ impl QleverClient {
         }
     }
 
-    async fn fetch_page(&self, offset: usize) -> Result<Vec<SparqlBinding>> {
+    async fn fetch_page(&self, base_query: &str, offset: usize) -> Result<Vec<SparqlBinding>> {
         const MAX_RETRIES: u32 = 5;
 
         for attempt in 0..=MAX_RETRIES {
-            let query = query_for_page(offset);
+            let query = query_for_page(base_query, offset);
             let response = match self
                 .client
                 .get(&self.endpoint)
@@ -214,30 +261,53 @@ fn retry_delay(retry_after: Option<u64>, attempt: u32) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(2_u64.pow(attempt).min(32)))
 }
 
-fn query_for_page(offset: usize) -> String {
-    format!("{LOTUS_SMILES_QUERY}\nLIMIT {QLEVER_PAGE_SIZE}\nOFFSET {offset}")
+fn query_for_page(base_query: &str, offset: usize) -> String {
+    format!("{base_query}\nLIMIT {QLEVER_PAGE_SIZE}\nOFFSET {offset}")
 }
 
 fn decode_sparql_bindings(bindings: Vec<SparqlBinding>) -> Result<Vec<SmilesRecord>> {
     bindings
         .into_iter()
         .map(|binding| {
-            let wikidata_id = binding
-                .compound
-                .value
-                .rsplit('/')
-                .next()
-                .filter(|id| id.starts_with('Q'))
-                .context("QLever compound is not a Wikidata entity URI")?
-                .to_owned();
+            let wikidata_id = wikidata_id(&binding.compound.value)?;
+            let inchi_key = binding
+                .inchi_key
+                .context("QLever keyed result lacks an InChIKey")?
+                .value;
             Ok(SmilesRecord {
-                inchi_key: binding.inchi_key.value,
+                inchi_key,
                 wikidata_id,
                 smiles_kind: SmilesKind::parse(&binding.smiles_kind.value)?,
                 smiles: binding.smiles.value,
             })
         })
         .collect()
+}
+
+fn decode_missing_inchi_key_bindings(
+    bindings: Vec<SparqlBinding>,
+) -> Result<Vec<MissingInchiKeyRecord>> {
+    bindings
+        .into_iter()
+        .map(|binding| {
+            if binding.inchi_key.is_some() {
+                bail!("QLever missing-InChIKey result unexpectedly includes P235");
+            }
+            Ok(MissingInchiKeyRecord {
+                wikidata_id: wikidata_id(&binding.compound.value)?,
+                smiles_kind: SmilesKind::parse(&binding.smiles_kind.value)?,
+                smiles: binding.smiles.value,
+            })
+        })
+        .collect()
+}
+
+fn wikidata_id(uri: &str) -> Result<String> {
+    uri.rsplit('/')
+        .next()
+        .filter(|id| id.starts_with('Q'))
+        .context("QLever compound is not a Wikidata entity URI")
+        .map(ToOwned::to_owned)
 }
 
 /// Validates each source value with the strict `smiles-rs` parser.
@@ -254,6 +324,28 @@ pub fn validate_smiles(records: &[SmilesRecord]) -> Vec<ParseErrorRecord> {
                 .err()
                 .map(|error| ParseErrorRecord {
                     inchi_key: record.inchi_key.clone(),
+                    wikidata_id: record.wikidata_id.clone(),
+                    smiles_kind: record.smiles_kind,
+                    smiles: record.smiles.clone(),
+                    error: error.to_string(),
+                })
+        })
+        .collect()
+}
+
+/// Validates source values excluded solely because they lack an InChIKey.
+pub fn validate_missing_inchi_key_smiles(
+    records: &[MissingInchiKeyRecord],
+) -> Vec<ParseErrorRecord> {
+    records
+        .iter()
+        .filter_map(|record| {
+            record
+                .smiles
+                .parse::<Smiles>()
+                .err()
+                .map(|error| ParseErrorRecord {
+                    inchi_key: String::new(),
                     wikidata_id: record.wikidata_id.clone(),
                     smiles_kind: record.smiles_kind,
                     smiles: record.smiles.clone(),
@@ -300,12 +392,16 @@ struct Manifest<'a> {
     archive_format: &'static str,
     fetched_at: DateTime<Utc>,
     qlever_endpoint: &'a str,
-    /// SPARQL query before its stable `LIMIT`/`OFFSET` pagination suffix.
+    /// SPARQL query selecting source records with P235.
     query: &'static str,
+    /// SPARQL query used to find entries excluded for missing P235.
+    missing_inchi_key_query: &'static str,
     /// Maximum result rows requested by each stable query page.
     page_size: usize,
-    /// Number of retrieved source values before InChIKey deduplication.
+    /// Number of source values with an InChIKey before deduplication.
     source_records: usize,
+    /// Number of source values excluded because P235 is absent.
+    missing_inchi_key_records: usize,
     /// Number of selected records after InChIKey deduplication.
     records: usize,
     parse_errors: usize,
@@ -313,14 +409,16 @@ struct Manifest<'a> {
 
 /// Paths emitted for one source snapshot.
 ///
-/// The manifest is both an archive member and a standalone Zenodo upload so
-/// its counts and provenance are inspectable in the record UI.
+/// The manifest and checksum file are standalone Zenodo uploads; the manifest
+/// is also an archive member, so provenance and integrity remain inspectable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveArtifacts {
     /// Gzip-compressed source archive.
     pub archive: PathBuf,
     /// Standalone copy of the archive manifest.
     pub manifest: PathBuf,
+    /// SHA-256 digests of the archive and standalone manifest.
+    pub checksums: PathBuf,
 }
 
 /// Writes a gzip-compressed tar archive and a standalone manifest beside it.
@@ -332,6 +430,7 @@ pub fn write_archive(
     fetched_at: DateTime<Utc>,
     endpoint: &str,
     source_records: usize,
+    missing_inchi_key_records: &[MissingInchiKeyRecord],
     records: &[SmilesRecord],
     parse_errors: &[ParseErrorRecord],
 ) -> Result<ArchiveArtifacts> {
@@ -342,14 +441,18 @@ pub fn write_archive(
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
 
     let records_csv = records_csv_bytes(records).context("encode LOTUS SMILES CSV")?;
+    let missing_inchi_key_csv = missing_inchi_key_csv_bytes(missing_inchi_key_records)
+        .context("encode missing InChIKey CSV")?;
     let errors_csv = parse_errors_csv_bytes(parse_errors).context("encode parser error CSV")?;
     let manifest = serde_json::to_vec_pretty(&Manifest {
         archive_format: "lotus-wikidata-smiles/v1",
         fetched_at,
         qlever_endpoint: endpoint,
         query: LOTUS_SMILES_QUERY,
+        missing_inchi_key_query: LOTUS_SMILES_WITHOUT_INCHIKEY_QUERY,
         page_size: QLEVER_PAGE_SIZE,
         source_records,
+        missing_inchi_key_records: missing_inchi_key_records.len(),
         records: records.len(),
         parse_errors: parse_errors.len(),
     })
@@ -358,26 +461,48 @@ pub fn write_archive(
     let file = File::create(output).with_context(|| format!("create {}", output.display()))?;
     let mut archive = Builder::new(GzEncoder::new(file, Compression::default()));
     append_member(&mut archive, "lotus-wikidata-smiles.csv", &records_csv)?;
+    append_member(&mut archive, "missing-inchikey.csv", &missing_inchi_key_csv)?;
     append_member(&mut archive, "smiles-parse-errors.csv", &errors_csv)?;
     append_member(&mut archive, "manifest.json", &manifest)?;
-    archive.finish().context("finish archive")?;
+    archive
+        .into_inner()
+        .context("finish tar archive")?
+        .finish()
+        .context("finish gzip archive")?;
 
-    let manifest_path = standalone_manifest_path(output)?;
+    let manifest_path = sibling_artifact_path(output, "manifest.json")?;
     std::fs::write(&manifest_path, &manifest)
         .with_context(|| format!("write {}", manifest_path.display()))?;
+    let checksum_path = sibling_artifact_path(output, "SHA256SUMS")?;
+    let archive_filename = output
+        .file_name()
+        .context("archive output path has no filename")?
+        .to_string_lossy();
+    let manifest_filename = manifest_path
+        .file_name()
+        .context("manifest output path has no filename")?
+        .to_string_lossy();
+    write_checksums(
+        &checksum_path,
+        &[
+            (output, archive_filename.as_ref()),
+            (&manifest_path, manifest_filename.as_ref()),
+        ],
+    )?;
     Ok(ArchiveArtifacts {
         archive: output.to_owned(),
         manifest: manifest_path,
+        checksums: checksum_path,
     })
 }
 
-fn standalone_manifest_path(archive: &Path) -> Result<PathBuf> {
+fn sibling_artifact_path(archive: &Path, suffix: &str) -> Result<PathBuf> {
     let filename = archive
         .file_name()
         .context("archive output path has no filename")?
         .to_string_lossy();
     let stem = filename.strip_suffix(".tar.gz").unwrap_or(&filename);
-    Ok(archive.with_file_name(format!("{stem}.manifest.json")))
+    Ok(archive.with_file_name(format!("{stem}.{suffix}")))
 }
 
 fn records_csv_bytes(records: &[SmilesRecord]) -> Result<Vec<u8>, csv::Error> {
@@ -400,6 +525,43 @@ fn parse_errors_csv_bytes(records: &[ParseErrorRecord]) -> Result<Vec<u8>, csv::
         writer.serialize(record)?;
     }
     Ok(writer.into_inner().map_err(|error| error.into_error())?)
+}
+
+fn missing_inchi_key_csv_bytes(records: &[MissingInchiKeyRecord]) -> Result<Vec<u8>, csv::Error> {
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(Vec::new());
+    writer.write_record(["wikidata_id", "smiles_kind", "smiles"])?;
+    for record in records {
+        writer.serialize(record)?;
+    }
+    Ok(writer.into_inner().map_err(|error| error.into_error())?)
+}
+
+fn write_checksums(path: &Path, files: &[(&Path, &str)]) -> Result<()> {
+    let mut output = String::new();
+    for (file, label) in files {
+        output.push_str(&sha256(file)?);
+        output.push_str("  ");
+        output.push_str(label);
+        output.push('\n');
+    }
+    std::fs::write(path, output).with_context(|| format!("write {}", path.display()))
+}
+
+fn sha256(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            return Ok(format!("{:x}", hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
+    }
 }
 
 fn append_member(
@@ -427,17 +589,15 @@ pub fn dry_run_publish_archive(
     creator: &str,
     publication_date: chrono::NaiveDate,
 ) -> Result<String> {
-    let _metadata = zenodo_metadata(title, creator, publication_date)?;
+    let source_code_url = source_code_url()?;
+    let _metadata = zenodo_metadata(title, creator, publication_date, &source_code_url)?;
     let _files = archive_upload(artifacts)?;
-    match std::env::var("ZENODO_ROOT_DEPOSITION_ID") {
-        Ok(root_id) => {
-            root_id
-                .parse::<u64>()
-                .context("parse ZENODO_ROOT_DEPOSITION_ID as a deposition ID")?;
-            Ok(format!("publish a new version from deposition {root_id}"))
-        }
-        Err(std::env::VarError::NotPresent) => Ok("publish the initial Zenodo record".to_owned()),
-        Err(error) => Err(error).context("read ZENODO_ROOT_DEPOSITION_ID"),
+    match root_deposition_id()? {
+        Some(root_id) => Ok(format!(
+            "publish a new version from deposition {}",
+            root_id.0
+        )),
+        None => Ok("publish the initial Zenodo record".to_owned()),
     }
 }
 
@@ -453,16 +613,14 @@ pub async fn publish_archive(
     publication_date: chrono::NaiveDate,
 ) -> Result<u64> {
     let client = ZenodoClient::from_env().context("read ZENODO_TOKEN")?;
-    let metadata = zenodo_metadata(title, creator, publication_date)?;
+    let source_code_url = source_code_url()?;
+    let metadata = zenodo_metadata(title, creator, publication_date, &source_code_url)?;
     let files = archive_upload(artifacts)?;
 
-    let publication = match std::env::var("ZENODO_ROOT_DEPOSITION_ID") {
-        Ok(root_id) => {
-            let root_id = root_id
-                .parse()
-                .context("parse ZENODO_ROOT_DEPOSITION_ID as a deposition ID")?;
+    let publication = match root_deposition_id()? {
+        Some(root_id) => {
             let draft = client
-                .ensure_editable_draft(DepositionId(root_id))
+                .ensure_editable_draft(root_id)
                 .await
                 .context("create or reuse versioned Zenodo draft")?;
             client
@@ -470,11 +628,10 @@ pub async fn publish_archive(
                 .await
                 .context("publish versioned archive to Zenodo")?
         }
-        Err(std::env::VarError::NotPresent) => client
+        None => client
             .create_and_publish_dataset(&metadata, files)
             .await
             .context("publish initial archive to Zenodo")?,
-        Err(error) => return Err(error).context("read ZENODO_ROOT_DEPOSITION_ID"),
     };
     Ok(publication.record.id.0)
 }
@@ -483,6 +640,7 @@ fn zenodo_metadata(
     title: &str,
     creator: &str,
     publication_date: chrono::NaiveDate,
+    source_code_url: &str,
 ) -> Result<DepositMetadataUpdate> {
     DepositMetadataUpdate::builder()
         .title(title)
@@ -497,9 +655,65 @@ fn zenodo_metadata(
         .keyword("LOTUS")
         .keyword("Wikidata")
         .keyword("SMILES")
+        .related_identifier(
+            RelatedIdentifier::builder()
+                .identifier(source_code_url)
+                .relation("isDerivedFrom")
+                .scheme("url")
+                .resource_type("software")
+                .build()
+                .context("build source-code related identifier")?,
+        )
         .community_identifier(LOTUS_ZENODO_COMMUNITY)
         .build()
         .context("build Zenodo metadata")
+}
+
+fn source_code_url() -> Result<String> {
+    if let Ok(url) = std::env::var("SOURCE_CODE_URL") {
+        return validate_source_code_url(url);
+    }
+
+    let server = std::env::var("GITHUB_SERVER_URL");
+    let repository = std::env::var("GITHUB_REPOSITORY");
+    let revision = std::env::var("GITHUB_SHA");
+    match (server, repository, revision) {
+        (Ok(server), Ok(repository), Ok(revision)) => {
+            validate_source_code_url(format!("{server}/{repository}/commit/{revision}"))
+        }
+        _ => bail!(
+            "set SOURCE_CODE_URL to the exact immutable source revision before publishing locally"
+        ),
+    }
+}
+
+fn validate_source_code_url(url: String) -> Result<String> {
+    let Some((_, revision)) = url.rsplit_once("/commit/") else {
+        bail!("SOURCE_CODE_URL must identify a commit with a /commit/<sha> suffix");
+    };
+    if !url.starts_with("https://")
+        || revision.len() != 40
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("SOURCE_CODE_URL must be an https URL ending in a full 40-character commit SHA");
+    }
+    Ok(url)
+}
+
+fn root_deposition_id() -> Result<Option<DepositionId>> {
+    match std::env::var("ZENODO_ROOT_DEPOSITION_ID") {
+        Ok(value) => {
+            let id: u64 = value
+                .parse()
+                .context("parse ZENODO_ROOT_DEPOSITION_ID as a published deposition ID")?;
+            if id == 0 {
+                bail!("ZENODO_ROOT_DEPOSITION_ID must be a non-zero published deposition ID");
+            }
+            Ok(Some(DepositionId(id)))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error).context("read ZENODO_ROOT_DEPOSITION_ID"),
+    }
 }
 
 fn archive_upload(artifacts: &ArchiveArtifacts) -> Result<Vec<UploadSpec>> {
@@ -515,9 +729,16 @@ fn archive_upload(artifacts: &ArchiveArtifacts) -> Result<Vec<UploadSpec>> {
         .context("manifest path does not have a filename")?
         .to_string_lossy()
         .into_owned();
+    let checksum_name = artifacts
+        .checksums
+        .file_name()
+        .context("checksum path does not have a filename")?
+        .to_string_lossy()
+        .into_owned();
     UploadSpec::from_named_paths([
         (archive_name, &artifacts.archive),
         (manifest_name, &artifacts.manifest),
+        (checksum_name, &artifacts.checksums),
     ])
     .context("prepare Zenodo archive uploads")
 }
@@ -531,7 +752,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-
     fn record(key: &str, id: &str, kind: SmilesKind, smiles: &str) -> SmilesRecord {
         SmilesRecord {
             inchi_key: key.to_owned(),
@@ -559,6 +779,11 @@ mod tests {
 
     #[test]
     fn packages_source_errors_and_query_provenance() {
+        let missing_inchi_key_records = vec![MissingInchiKeyRecord {
+            wikidata_id: "Q2".to_owned(),
+            smiles_kind: SmilesKind::Canonical,
+            smiles: "O".to_owned(),
+        }];
         let directory = tempdir().unwrap();
         let path = directory.path().join("lotus.tar.gz");
         let records = vec![record("KEY1", "Q1", SmilesKind::Canonical, "CCO")];
@@ -569,6 +794,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 9, 17, 0, 0, 0).unwrap(),
             DEFAULT_QLEVER_ENDPOINT,
             records.len(),
+            &missing_inchi_key_records,
             &records,
             &errors,
         )
@@ -586,6 +812,10 @@ mod tests {
         }
         assert!(members["lotus-wikidata-smiles.csv"].contains("KEY1,Q1,canonical,CCO"));
         assert_eq!(
+            members["missing-inchikey.csv"],
+            "wikidata_id,smiles_kind,smiles\nQ2,canonical,O\n"
+        );
+        assert_eq!(
             members["smiles-parse-errors.csv"],
             "inchi_key,wikidata_id,smiles_kind,smiles,error\n"
         );
@@ -595,24 +825,29 @@ mod tests {
             members["manifest.json"]
         );
         let uploads = archive_upload(&artifacts).unwrap();
-        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads.len(), 3);
         assert_eq!(uploads[1].filename, "lotus.manifest.json");
+        assert_eq!(uploads[2].filename, "lotus.SHA256SUMS");
+        let checksums = std::fs::read_to_string(&artifacts.checksums).unwrap();
+        assert!(checksums.contains("  lotus.tar.gz\n"));
+        assert!(checksums.contains("  lotus.manifest.json\n"));
+        assert!(checksums.starts_with(&sha256(&artifacts.archive).unwrap()));
         assert_eq!(manifest["query"], LOTUS_SMILES_QUERY);
         assert_eq!(manifest["page_size"], QLEVER_PAGE_SIZE);
         assert_eq!(manifest["source_records"], 1);
         assert_eq!(manifest["records"], 1);
         assert_eq!(manifest["parse_errors"], 0);
+        assert_eq!(manifest["missing_inchi_key_records"], 1);
     }
-
     #[test]
     fn decodes_qlever_rows_and_deduplicates_by_inchi_key() {
         let bindings = vec![SparqlBinding {
             compound: SparqlValue {
                 value: "http://www.wikidata.org/entity/Q153".into(),
             },
-            inchi_key: SparqlValue {
+            inchi_key: Some(SparqlValue {
                 value: "LFQSCWFLJHTTHZ-UHFFFAOYSA-N".into(),
-            },
+            }),
             smiles: SparqlValue {
                 value: "CCO".into(),
             },
@@ -633,6 +868,36 @@ mod tests {
     }
 
     #[test]
+    fn reports_and_validates_smiles_without_inchi_keys() {
+        let missing = decode_missing_inchi_key_bindings(vec![SparqlBinding {
+            compound: SparqlValue {
+                value: "http://www.wikidata.org/entity/Q154".into(),
+            },
+            inchi_key: None,
+            smiles: SparqlValue {
+                value: "C1CC".into(),
+            },
+            smiles_kind: SparqlValue {
+                value: "isomeric".into(),
+            },
+        }])
+        .unwrap();
+
+        assert_eq!(
+            missing,
+            vec![MissingInchiKeyRecord {
+                wikidata_id: "Q154".to_owned(),
+                smiles_kind: SmilesKind::Isomeric,
+                smiles: "C1CC".to_owned(),
+            }]
+        );
+        let errors = validate_missing_inchi_key_smiles(&missing);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].inchi_key, "");
+        assert_eq!(errors[0].wikidata_id, "Q154");
+    }
+
+    #[test]
     fn deduplication_prefers_isomeric_smiles_over_canonical_smiles() {
         let selected = deduplicate_by_inchi_key(vec![
             record("KEY1", "Q1", SmilesKind::Canonical, "CCO"),
@@ -646,6 +911,39 @@ mod tests {
                 record("KEY1", "Q2", SmilesKind::Isomeric, "C[C@H](O)C"),
                 record("KEY2", "Q3", SmilesKind::Canonical, "N"),
             ]
+        );
+    }
+
+    #[test]
+    fn publication_metadata_links_the_exact_source_revision() {
+        let metadata = zenodo_metadata(
+            "LOTUS Wikidata SMILES",
+            "The LOTUS Initiative",
+            Utc.with_ymd_and_hms(2026, 9, 17, 0, 0, 0)
+                .unwrap()
+                .date_naive(),
+            "https://github.com/oolonek/lotus-SMILES/commit/0123456789abcdef0123456789abcdef01234567",
+        )
+        .unwrap();
+
+        assert_eq!(metadata.related_identifiers.len(), 1);
+        assert_eq!(
+            metadata.related_identifiers[0].identifier,
+            "https://github.com/oolonek/lotus-SMILES/commit/0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(metadata.related_identifiers[0].relation, "isDerivedFrom");
+    }
+
+    #[test]
+    fn rejects_non_immutable_source_code_urls() {
+        assert!(
+            validate_source_code_url("https://github.com/oolonek/lotus-SMILES".to_owned()).is_err()
+        );
+        assert!(
+            validate_source_code_url(
+                "https://github.com/oolonek/lotus-SMILES/commit/0123456789abcdef".to_owned()
+            )
+            .is_err()
         );
     }
 }
