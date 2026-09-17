@@ -84,8 +84,9 @@ export ZENODO_ROOT_DEPOSITION_ID=1234567
 Do not use a concept DOI or its numeric suffix as `ZENODO_ROOT_DEPOSITION_ID`. With a valid root ID, the client asks `zenodo-rs` for the latest published version, creates its editable `newversion` draft, uploads the next archive, and publishes it. This preserves the Zenodo concept record and its version history rather than creating unrelated deposits. Every record is a public `CC-BY-4.0` Dataset submitted to the `the-lotus-initiative` community. Community acceptance may still require moderator approval.
 
 ## Scheduled GitHub Actions operation
+`ci.yml` runs formatting checks, Clippy with warnings denied, and the test suite for every push and pull request.
 
-`publish.yml` runs every Monday at 03:17 UTC and also supports manual dispatch. It serializes all production publications with the `lotus-zenodo-publish` concurrency group. Configure these repository values before enabling it:
+`publish.yml` runs every Monday at 08:00 UTC and also supports manual dispatch. It serializes all production publications with the `lotus-zenodo-publish` concurrency group. Configure these repository values before enabling it:
 
 - Actions secret `ZENODO_TOKEN` — production Zenodo token.
 - Actions variable `ZENODO_ROOT_DEPOSITION_ID` — concrete published deposition ID, never a concept DOI suffix.
