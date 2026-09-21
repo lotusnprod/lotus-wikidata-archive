@@ -2,11 +2,20 @@ name: Publish LOTUS Wikidata SMILES
 
 on:
   schedule:
-    - cron: '0 8 * * 1'
+    # Avoid GitHub Actions' congested top-of-hour window.
+    - cron: '17 8 * * 1'
+    # Recover a missed Monday dispatch without creating a second weekly version.
+    - cron: '43 8 * * 2'
   workflow_dispatch:
+    inputs:
+      force_publish:
+        description: Publish even when this ISO week already has a snapshot tag
+        required: false
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: lotus-zenodo-publish
@@ -21,12 +30,44 @@ jobs:
       ZENODO_ROOT_DEPOSITION_ID: ${{ vars.ZENODO_ROOT_DEPOSITION_ID }}
     steps:
       - uses: actions/checkout@v7
+      - name: Decide whether this ISO week needs a snapshot
+        id: weekly_snapshot
+        env:
+          FORCE_PUBLISH: ${{ inputs.force_publish }}
+        run: |
+          snapshot_tag="lotus-snapshot-$(date -u +%G-W%V)"
+          echo "snapshot_tag=$snapshot_tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE_PUBLISH" = true ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$snapshot_tag" >/dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.weekly_snapshot.outputs.publish == 'true'
       - name: Require configured Zenodo record family
+        if: steps.weekly_snapshot.outputs.publish == 'true'
         run: test -n "$ZENODO_ROOT_DEPOSITION_ID"
       - name: Fetch, validate, package, and publish next version
+        if: steps.weekly_snapshot.outputs.publish == 'true'
         run: cargo run --release -- --output-dir artifacts --publish --creator 'The LOTUS Initiative'
+      - name: Mark ISO week as published
+        if: steps.weekly_snapshot.outputs.publish == 'true'
+        env:
+          SNAPSHOT_TAG: ${{ steps.weekly_snapshot.outputs.snapshot_tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag --annotate "$SNAPSHOT_TAG" --message "LOTUS snapshot $SNAPSHOT_TAG"
+          git push origin "refs/tags/$SNAPSHOT_TAG"
       - name: Retain generated archive provenance
+        if: steps.weekly_snapshot.outputs.publish == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: lotus-wikidata-smiles
